@@ -4,6 +4,586 @@ import shlex
 import shutil
 import socket
 import subprocess
+import tempfile
+from pathlib import Path
+
+from flask import Flask, after_this_request, jsonify, request, send_file
+
+
+APP = Flask(__name__)
+ROOT_DIR = Path.cwd().resolve()
+CURRENT_DIR = ROOT_DIR
+
+TEXT_EXTENSIONS = {
+    ".txt",
+    ".md",
+    ".py",
+    ".json",
+    ".yaml",
+    ".yml",
+    ".ini",
+    ".cfg",
+    ".csv",
+    ".log",
+    ".xml",
+    ".html",
+    ".css",
+    ".js",
+    ".ts",
+    ".sh",
+    ".bash",
+}
+IMAGE_EXTENSIONS = {".jpg", ".jpeg", ".png", ".gif", ".webp", ".bmp", ".svg"}
+
+
+def safe_path(raw_path: str | None) -> Path:
+    if not raw_path:
+        return CURRENT_DIR
+    candidate = Path(raw_path).expanduser()
+    candidate = (CURRENT_DIR / candidate).resolve() if not candidate.is_absolute() else candidate.resolve()
+    if ROOT_DIR not in [candidate, *candidate.parents]:
+        raise ValueError("Path is outside workspace root")
+    return candidate
+
+
+def run_capture(cmd: list[str]) -> str:
+    try:
+        return subprocess.run(cmd, capture_output=True, text=True, check=True).stdout.strip()
+    except Exception:
+        return "N/A"
+
+
+def bytes_to_human(value: int) -> str:
+    units = ["B", "KB", "MB", "GB", "TB"]
+    num = float(value)
+    idx = 0
+    while num >= 1024 and idx < len(units) - 1:
+        num /= 1024
+        idx += 1
+    return f"{num:.1f} {units[idx]}"
+
+
+def linux_uptime_pretty() -> str:
+    try:
+        with open("/proc/uptime", "r", encoding="utf-8") as f:
+            uptime_seconds = int(float(f.read().split()[0]))
+        days, rem = divmod(uptime_seconds, 86400)
+        hours, rem = divmod(rem, 3600)
+        minutes, _ = divmod(rem, 60)
+        return f"{days}d {hours:02d}h {minutes:02d}m" if days > 0 else f"{hours:02d}h {minutes:02d}m"
+    except Exception:
+        return "N/A"
+
+
+def memory_stats() -> tuple[str, str]:
+    try:
+        with open("/proc/meminfo", "r", encoding="utf-8") as f:
+            lines = f.read().splitlines()
+        vals = {}
+        for line in lines:
+            parts = line.split(":")
+            if len(parts) != 2:
+                continue
+            key = parts[0].strip()
+            num = int(parts[1].strip().split()[0]) * 1024
+            vals[key] = num
+        total = vals.get("MemTotal", 0)
+        avail = vals.get("MemAvailable", 0)
+        used = max(0, total - avail)
+        pct = (used / total * 100) if total else 0
+        return f"{bytes_to_human(used)} / {bytes_to_human(total)}", f"{pct:.1f}%"
+    except Exception:
+        return "N/A", "N/A"
+
+
+def disk_stats(path: Path) -> tuple[str, str]:
+    try:
+        st = shutil.disk_usage(path)
+        pct = (st.used / st.total * 100) if st.total else 0
+        return f"{bytes_to_human(st.used)} / {bytes_to_human(st.total)}", f"{pct:.1f}%"
+    except Exception:
+        return "N/A", "N/A"
+
+
+def cpu_model() -> str:
+    try:
+        with open("/proc/cpuinfo", "r", encoding="utf-8") as f:
+            for line in f:
+                if line.lower().startswith("model name"):
+                    return line.split(":", 1)[1].strip()
+    except Exception:
+        pass
+    return platform.processor() or "N/A"
+
+
+def system_stats() -> dict:
+    mem_text, mem_pct = memory_stats()
+    disk_text, disk_pct = disk_stats(ROOT_DIR)
+    load_avg = "N/A"
+    try:
+        l1, l5, l15 = os.getloadavg()
+        load_avg = f"{l1:.2f} {l5:.2f} {l15:.2f}"
+    except Exception:
+        pass
+    ip_raw = run_capture(["hostname", "-I"])
+    return {
+        "hostname": socket.gethostname(),
+        "ip": ip_raw.split()[0] if ip_raw != "N/A" and ip_raw else "N/A",
+        "user": os.getenv("USER") or "N/A",
+        "kernel": run_capture(["uname", "-sr"]),
+        "arch": platform.machine(),
+        "uptime": linux_uptime_pretty(),
+        "loadavg": load_avg,
+        "processes": max(0, len(run_capture(["ps", "-e"]).splitlines()) - 1),
+        "mem_text": mem_text,
+        "mem_pct": mem_pct,
+        "disk_text": disk_text,
+        "disk_pct": disk_pct,
+        "cpu": cpu_model(),
+        "cwd": str(CURRENT_DIR),
+    }
+
+
+def file_kind(path: Path) -> str:
+    if path.is_dir():
+        return "dir"
+    ext = path.suffix.lower()
+    if ext in IMAGE_EXTENSIONS:
+        return "image"
+    if ext in TEXT_EXTENSIONS or ext == "":
+        return "text"
+    if ext == ".zip":
+        return "zip"
+    return "file"
+
+
+def list_dir(path: Path) -> list[dict]:
+    rows = []
+    for item in sorted(path.iterdir(), key=lambda p: (p.is_file(), p.name.lower())):
+        rows.append(
+            {
+                "name": item.name,
+                "path": str(item),
+                "is_dir": item.is_dir(),
+                "kind": file_kind(item),
+                "size_human": bytes_to_human(item.stat().st_size) if item.is_file() else "-",
+                "ext": item.suffix.lower(),
+            }
+        )
+    return rows
+
+
+def run_linux_like(command: str) -> tuple[str, bool]:
+    global CURRENT_DIR
+    try:
+        parts = shlex.split(command)
+    except ValueError as ex:
+        return str(ex), False
+    if not parts:
+        return "", True
+    cmd = parts[0]
+    args = parts[1:]
+    try:
+        if cmd in {"help", "?"}:
+            return (
+                "Builtins: pwd, ls, cd, cat, clear, mkdir, touch, rm, cp, mv, echo, whoami, uname, df, free\n"
+                "Unknown commands run in Linux shell.",
+                True,
+            )
+        if cmd == "pwd":
+            return str(CURRENT_DIR), True
+        if cmd == "ls":
+            target = safe_path(args[0]) if args else CURRENT_DIR
+            if not target.exists():
+                return f"ls: cannot access '{target}'", False
+            if target.is_file():
+                return target.name, True
+            return "\n".join(sorted([("[D] " if p.is_dir() else "[F] ") + p.name for p in target.iterdir()])) or "(empty)", True
+        if cmd == "cd":
+            target = safe_path(args[0]) if args else ROOT_DIR
+            if not target.exists() or not target.is_dir():
+                return f"cd: no such directory: {target}", False
+            CURRENT_DIR = target
+            return str(CURRENT_DIR), True
+        if cmd == "cat":
+            if not args:
+                return "cat: missing operand", False
+            target = safe_path(args[0])
+            if not target.exists() or not target.is_file():
+                return "cat: file not found", False
+            if file_kind(target) == "image":
+                return "image file: open in Files section", True
+            return target.read_text(encoding="utf-8", errors="replace"), True
+        if cmd == "mkdir":
+            safe_path(args[0]).mkdir(parents=True, exist_ok=True)
+            return "directory created", True
+        if cmd == "touch":
+            safe_path(args[0]).touch(exist_ok=True)
+            return "file touched", True
+        if cmd == "rm":
+            recursive = any(flag in args for flag in ("-r", "-rf", "-fr"))
+            target_arg = [a for a in args if not a.startswith("-")]
+            target = safe_path(target_arg[0])
+            if target.is_dir():
+                if not recursive:
+                    return "rm: is a directory (use -r)", False
+                shutil.rmtree(target)
+            else:
+                target.unlink()
+            return "removed", True
+        if cmd == "cp":
+            src, dst = safe_path(args[0]), safe_path(args[1])
+            shutil.copytree(src, dst, dirs_exist_ok=True) if src.is_dir() else shutil.copy2(src, dst)
+            return "copied", True
+        if cmd == "mv":
+            shutil.move(str(safe_path(args[0])), str(safe_path(args[1])))
+            return "moved", True
+        if cmd == "echo":
+            return " ".join(args), True
+        if cmd == "clear":
+            return "__CLEAR__", True
+        if cmd == "whoami":
+            return os.getenv("USER") or "unknown", True
+        if cmd == "uname":
+            return run_capture(["uname", "-a"]), True
+        if cmd == "df":
+            return run_capture(["df", "-h"]), True
+        if cmd == "free":
+            return run_capture(["free", "-h"]), True
+    except Exception as ex:
+        return str(ex), False
+
+    try:
+        res = subprocess.run(command, shell=True, cwd=str(CURRENT_DIR), capture_output=True, text=True, timeout=30)
+        output = ((res.stdout or "") + (res.stderr or "")).strip() or "(done)"
+        return output, res.returncode == 0
+    except Exception as ex:
+        return str(ex), False
+
+
+HTML = """
+<!doctype html>
+<html lang="ru">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <title>Linux Server Control Panel</title>
+  <style>
+    :root{--bg:#070d1a;--panel:#101b31;--panel2:#12223f;--line:#2a3f68;--text:#ecf4ff;--muted:#9ab0d6;--neon:#00d9ff;--ok:#35d683;--bad:#ff7b91}
+    *{box-sizing:border-box;font-family:Inter,Segoe UI,Arial,sans-serif}
+    body{margin:0;background:radial-gradient(circle at top right,#15305f 0%,var(--bg) 45%);color:var(--text)}
+    .wrap{max-width:1600px;margin:14px auto;padding:0 14px}
+    .hero{display:flex;justify-content:space-between;align-items:center;margin-bottom:8px}
+    .hero h1{margin:0;font-size:30px}.muted{color:var(--muted);font-size:13px}
+    .tabs{display:flex;gap:8px;margin:10px 0}
+    .tab{background:#1a2f57;border:1px solid var(--line);color:var(--text);padding:10px 14px;border-radius:10px;cursor:pointer;transition:.15s}
+    .tab:hover{background:#284d8a}.tab.active{outline:2px solid #00d9ff55}
+    .page{display:none}.page.active{display:block}
+    .grid2{display:grid;grid-template-columns:1.45fr .9fr;gap:12px}
+    .grid3{display:grid;grid-template-columns:repeat(3,1fr);gap:12px}
+    .card,.panel{background:linear-gradient(160deg,var(--panel),var(--panel2));border:1px solid var(--line);border-radius:14px;box-shadow:0 8px 24px #00000055}
+    .card{padding:14px;min-height:106px}.label{font-size:12px;color:var(--muted)}.value{font-size:24px;font-weight:700;margin-top:8px}
+    .panel{padding:12px}.panel h3{margin:0 0 8px 0}
+    .toolbar{display:flex;gap:8px;flex-wrap:wrap;margin-bottom:8px}
+    .btn{background:#1a2f57;border:1px solid var(--line);border-radius:9px;color:var(--text);padding:8px 10px;cursor:pointer;transition:.14s}
+    .btn:hover{background:#284d8a}.btn.ok:hover{background:#1f4f3d}.btn.bad:hover{background:#5e2a3d}
+    .path{font-size:12px;color:var(--neon);word-break:break-all}
+    .term{height:calc(100vh - 250px);min-height:450px;overflow:auto;background:#091325;border:1px solid var(--line);border-radius:10px;padding:10px;font-family:Consolas,monospace;font-size:13px;white-space:pre-wrap}
+    .line-cmd{color:var(--neon)} .line-ok{color:var(--text)} .line-err{color:var(--bad)}
+    .chips{display:flex;gap:6px;flex-wrap:wrap;margin:8px 0}.chip{font-size:12px;color:#c2d4f2;background:#132746;border:1px solid #2d4676;border-radius:999px;padding:5px 8px;cursor:pointer}.chip:hover{background:#1d3966}
+    input[type=text], textarea{width:100%;background:#0b162c;color:var(--text);border:1px solid var(--line);border-radius:10px;padding:10px}
+    .files-panel{min-height:calc(100vh - 180px)}
+    .files{height:calc(100vh - 290px);min-height:560px;overflow:auto;background:#091325;border:1px solid var(--line);border-radius:10px;padding:8px}
+    .file{display:flex;gap:8px;align-items:center;padding:8px;border-radius:8px;border:1px solid transparent;cursor:pointer}
+    .file:hover{background:#142849}.file.active{background:#17325a;border-color:#00d9ff66}
+    .name{max-width:840px;white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
+    .dot{width:10px;height:10px;border-radius:50%}
+    .dot.dir{background:#8fb0ff}.dot.text{background:#9fb7ff}.dot.image{background:#68f0ce}.dot.zip{background:#ffc857}.dot.file{background:#aab7d1}
+    textarea{height:calc(100vh - 360px);min-height:430px;resize:vertical;font-family:Consolas,monospace}
+    .imgbox{height:calc(100vh - 360px);min-height:430px;background:#091325;border:1px solid var(--line);border-radius:10px;display:flex;align-items:center;justify-content:center}
+    .imgbox img{max-width:100%;max-height:100%}
+    .stat-list{display:grid;grid-template-columns:repeat(2,1fr);gap:10px}.stat-item{background:#0c1830;border:1px solid var(--line);border-radius:10px;padding:10px}
+    #toast{position:fixed;right:14px;bottom:14px;background:#132746;border:1px solid #2d4676;padding:10px 12px;border-radius:10px;display:none;z-index:80}
+    .modal{position:fixed;inset:0;background:#020713dd;backdrop-filter:blur(4px);display:none;align-items:center;justify-content:center;z-index:90}
+    .modal.show{display:flex}.modal-card{width:min(96vw,1500px);height:min(95vh,980px);background:linear-gradient(160deg,var(--panel),var(--panel2));border:1px solid var(--line);border-radius:14px;padding:12px;display:flex;flex-direction:column;gap:10px}
+    .modal-head{display:flex;justify-content:space-between;align-items:center;gap:8px}#fullscreen-editor{flex:1;width:100%;height:100%;resize:none}
+    @media (max-width:1280px){.grid2,.grid3,.stat-list{grid-template-columns:1fr}.files{height:560px}.term{height:480px}}
+  </style>
+</head>
+<body>
+  <div class="wrap">
+    <div class="hero">
+      <div><h1>Linux Server Control Panel</h1><div class="muted">Полный веб-интерфейс: Консоль, Файлы, Статистика</div></div>
+      <div class="muted" id="cwd-top"></div>
+    </div>
+
+    <div class="tabs">
+      <button class="tab active" data-page="console">Консоль</button>
+      <button class="tab" data-page="files">Папки и файлы</button>
+      <button class="tab" data-page="stats">Linux-статистика</button>
+    </div>
+
+    <div id="page-console" class="page active">
+      <div class="panel">
+        <h3>Linux Console</h3>
+        <div class="path" id="console-path"></div>
+        <div class="chips">
+          <span class="chip" onclick="insertCmd('ls -la')">ls -la</span><span class="chip" onclick="insertCmd('pwd')">pwd</span>
+          <span class="chip" onclick="insertCmd('cd ..')">cd ..</span><span class="chip" onclick="insertCmd('df -h')">df -h</span>
+          <span class="chip" onclick="insertCmd('free -h')">free -h</span><span class="chip" onclick="insertCmd('help')">help</span>
+        </div>
+        <div id="terminal" class="term"></div>
+        <div class="toolbar" style="margin-top:8px">
+          <input id="command" type="text" placeholder="Введите linux команду..." />
+          <button class="btn" onclick="runCommand()">Run</button><button class="btn" onclick="clearTerminal()">Clear</button>
+        </div>
+      </div>
+    </div>
+
+    <div id="page-files" class="page">
+      <div class="grid2">
+        <div class="panel files-panel">
+          <h3>Папки и файлы</h3>
+          <div class="path" id="files-path"></div>
+          <input id="file-search" type="text" placeholder="Поиск по имени..." style="margin:8px 0" />
+          <div class="toolbar">
+            <button class="btn" onclick="goUp()">Вверх</button><button class="btn" onclick="refreshFiles()">Обновить</button>
+            <button class="btn" onclick="createFile()">Новый файл</button><button class="btn" onclick="pickUpload()">Загрузить</button>
+            <button class="btn" onclick="downloadSelected()">Скачать</button>
+            <input id="upload" type="file" multiple style="display:none" />
+          </div>
+          <div id="file-list" class="files"></div>
+        </div>
+        <div class="panel">
+          <h3>Просмотр / Редактирование</h3>
+          <div id="selected-name" style="font-weight:700">Ничего не выбрано</div>
+          <div id="selected-info" class="muted" style="margin:6px 0 8px 0">Выберите файл или папку слева.</div>
+          <div class="toolbar">
+            <button class="btn" onclick="openFolder()">Открыть папку</button><button class="btn ok" onclick="saveFile()">Сохранить</button>
+            <button class="btn" onclick="openFullscreenEditor()">На весь экран</button><button class="btn bad" onclick="deleteSelected()">Удалить</button>
+          </div>
+          <div id="preview"></div>
+        </div>
+      </div>
+    </div>
+
+    <div id="page-stats" class="page">
+      <div class="grid3" style="margin-bottom:12px">
+        <div class="card"><div class="label">Uptime</div><div id="s-uptime" class="value">-</div></div>
+        <div class="card"><div class="label">Load Average (1/5/15)</div><div id="s-loadavg" class="value">-</div></div>
+        <div class="card"><div class="label">Processes</div><div id="s-proc" class="value">-</div></div>
+      </div>
+      <div class="panel">
+        <h3>Системные метрики (Linux)</h3>
+        <div class="stat-list">
+          <div class="stat-item"><div class="label">Hostname</div><div id="s-hostname"></div></div><div class="stat-item"><div class="label">IP Address</div><div id="s-ip"></div></div>
+          <div class="stat-item"><div class="label">Current User</div><div id="s-user"></div></div><div class="stat-item"><div class="label">Kernel</div><div id="s-kernel"></div></div>
+          <div class="stat-item"><div class="label">Arch</div><div id="s-arch"></div></div><div class="stat-item"><div class="label">CPU</div><div id="s-cpu"></div></div>
+          <div class="stat-item"><div class="label">Memory</div><div id="s-mem"></div></div><div class="stat-item"><div class="label">Disk</div><div id="s-disk"></div></div>
+        </div>
+      </div>
+    </div>
+  </div>
+
+  <div id="toast"></div>
+  <div id="editor-modal" class="modal">
+    <div class="modal-card">
+      <div class="modal-head">
+        <div><div style="font-weight:700" id="fullscreen-title">Редактор</div><div class="muted" id="fullscreen-subtitle"></div></div>
+        <div class="toolbar" style="margin:0"><button class="btn ok" onclick="saveFullscreenEditor()">Сохранить</button><button class="btn" onclick="closeFullscreenEditor()">Закрыть</button></div>
+      </div>
+      <textarea id="fullscreen-editor" placeholder="Откройте текстовый файл для редактирования..."></textarea>
+    </div>
+  </div>
+
+  <script>
+    let selected = null, selectedType = null, selectedName = null, filesCache = [];
+    function showToast(msg,bad=false){const el=document.getElementById("toast");el.textContent=msg;el.style.background=bad?"#3c2130":"#132746";el.style.borderColor=bad?"#7d3953":"#2d4676";el.style.display="block";clearTimeout(window.__toastTimer);window.__toastTimer=setTimeout(()=>el.style.display="none",2200);}
+    function addTermLine(text,cls="line-ok"){const term=document.getElementById("terminal"),div=document.createElement("div");div.className=cls;div.textContent=text;term.appendChild(div);term.scrollTop=term.scrollHeight;}
+    function clearTerminal(){document.getElementById("terminal").innerHTML="";}
+    function insertCmd(cmd){const input=document.getElementById("command");input.value=cmd;input.focus();}
+    function downloadSelected(){if(!selected){showToast("Сначала выберите файл или папку.",true);return;}window.open("/api/download?path="+encodeURIComponent(selected),"_blank");}
+    function openFullscreenEditor(){if(!selected||selectedType!=="text"){showToast("Откройте текстовый файл.",true);return;}const editor=document.getElementById("editor");if(!editor){showToast("Редактор не открыт.",true);return;}document.getElementById("fullscreen-title").textContent=selectedName||"Редактор";document.getElementById("fullscreen-subtitle").textContent=selected||"";document.getElementById("fullscreen-editor").value=editor.value;document.getElementById("editor-modal").classList.add("show");}
+    function closeFullscreenEditor(){const modal=document.getElementById("editor-modal");if(!modal.classList.contains("show"))return;const editor=document.getElementById("editor");if(editor){editor.value=document.getElementById("fullscreen-editor").value;}modal.classList.remove("show");}
+    async function saveFullscreenEditor(){if(!selected||selectedType!=="text"){showToast("Выберите текстовый файл.",true);return;}const full=document.getElementById("fullscreen-editor"),editor=document.getElementById("editor");if(editor)editor.value=full.value;await saveFile();}
+    async function fetchStats(){const r=await fetch("/api/stats");const s=await r.json();document.getElementById("cwd-top").textContent=s.cwd;document.getElementById("console-path").textContent=s.cwd;document.getElementById("files-path").textContent=s.cwd;document.getElementById("s-uptime").textContent=s.uptime;document.getElementById("s-loadavg").textContent=s.loadavg;document.getElementById("s-proc").textContent=s.processes;document.getElementById("s-hostname").textContent=s.hostname;document.getElementById("s-ip").textContent=s.ip;document.getElementById("s-user").textContent=s.user;document.getElementById("s-kernel").textContent=s.kernel;document.getElementById("s-arch").textContent=s.arch;document.getElementById("s-cpu").textContent=s.cpu;document.getElementById("s-mem").textContent=`${s.mem_text} (${s.mem_pct})`;document.getElementById("s-disk").textContent=`${s.disk_text} (${s.disk_pct})`;}
+    async function runCommand(){const input=document.getElementById("command"),cmd=input.value.trim();if(!cmd)return;addTermLine(`$ ${cmd}`,"line-cmd");input.value="";const r=await fetch("/api/run",{method:"POST",headers:{"Content-Type":"application/json"},body:JSON.stringify({command:cmd})});const d=await r.json();if(d.clear)clearTerminal();if(d.output){d.output.split("\\n").forEach(line=>addTermLine(line,d.ok?"line-ok":"line-err"));}await fetchStats();await refreshFiles();}
+    function renderFileList(items){const box=document.getElementById("file-list");box.innerHTML="";items.forEach(item=>{const row=document.createElement("div");row.className="file"+(selected===item.path?" active":"");row.innerHTML=`<span class="dot ${item.kind}"></span><div><div class="name" title="${item.name}">${item.name}</div><div class="muted">${item.is_dir?"folder":(item.ext||"file")} ${item.is_dir?"":"• "+item.size_human}</div></div>`;row.onclick=()=>selectItem(item.path);row.ondblclick=async()=>{if(item.is_dir){selected=item.path;await openFolder();}};box.appendChild(row);});}
+    async function refreshFiles(){const r=await fetch("/api/files"),d=await r.json();filesCache=d.items||[];renderFileList(filesCache);}
+    async function selectItem(path){const r=await fetch("/api/read?path="+encodeURIComponent(path)),d=await r.json();if(!d.ok){showToast(d.message||"Ошибка чтения",true);return;}selected=path;selectedType=d.kind;selectedName=d.name;document.getElementById("selected-name").textContent=d.name;document.getElementById("selected-info").textContent=d.info;const preview=document.getElementById("preview");preview.innerHTML="";if(d.kind==="image"){preview.innerHTML=`<div class="imgbox"><img src="/api/image?path=${encodeURIComponent(path)}" alt="${d.name}" /></div>`;}else if(d.kind==="text"){preview.innerHTML=`<textarea id="editor">${(d.content||"").replaceAll("<","&lt;")}</textarea>`;}else{preview.innerHTML=`<div class="muted">Для этого типа доступен только просмотр метаданных.</div>`;}renderFileList(filesCache);}
+    async function saveFile(){if(!selected||selectedType!=="text"){showToast("Выберите текстовый файл.",true);return;}const editor=document.getElementById("editor");if(!editor){showToast("Редактор не открыт.",true);return;}const r=await fetch("/api/save",{method:"POST",headers:{"Content-Type":"application/json"},body:JSON.stringify({path:selected,content:editor.value})});const d=await r.json();showToast(d.message,!d.ok);}
+    async function deleteSelected(){if(!selected){showToast("Выберите файл или папку.",true);return;}if(!confirm(`Удалить ${selectedName}?`))return;const r=await fetch("/api/delete",{method:"POST",headers:{"Content-Type":"application/json"},body:JSON.stringify({path:selected})});const d=await r.json();showToast(d.message,!d.ok);if(d.ok){selected=null;document.getElementById("selected-name").textContent="Ничего не выбрано";document.getElementById("selected-info").textContent="Выберите файл или папку слева.";document.getElementById("preview").innerHTML="";await refreshFiles();}}
+    async function openFolder(){if(!selected){showToast("Выберите папку.",true);return;}const r=await fetch("/api/open",{method:"POST",headers:{"Content-Type":"application/json"},body:JSON.stringify({path:selected})});const d=await r.json();showToast(d.message,!d.ok);if(d.ok){selected=null;document.getElementById("preview").innerHTML="";document.getElementById("selected-name").textContent="Ничего не выбрано";document.getElementById("selected-info").textContent="Выберите файл или папку слева.";await fetchStats();await refreshFiles();}}
+    async function goUp(){await fetch("/api/up",{method:"POST"});await fetchStats();await refreshFiles();}
+    async function createFile(){const name=prompt("Имя файла (например notes.txt)");if(!name)return;const r=await fetch("/api/create",{method:"POST",headers:{"Content-Type":"application/json"},body:JSON.stringify({name})});const d=await r.json();showToast(d.message,!d.ok);await refreshFiles();}
+    function pickUpload(){document.getElementById("upload").click();}
+    document.getElementById("upload").addEventListener("change",async(ev)=>{const files=ev.target.files;if(!files.length)return;const fd=new FormData();for(const f of files)fd.append("files",f);const r=await fetch("/api/upload",{method:"POST",body:fd});const d=await r.json();showToast(d.message,!d.ok);ev.target.value="";await refreshFiles();});
+    document.getElementById("command").addEventListener("keydown",(e)=>{if(e.key==="Enter")runCommand();});
+    document.addEventListener("keydown",(e)=>{if(e.key==="Escape")closeFullscreenEditor();if((e.ctrlKey||e.metaKey)&&e.key.toLowerCase()==="s"&&document.getElementById("editor-modal").classList.contains("show")){e.preventDefault();saveFullscreenEditor();}});
+    document.getElementById("file-search").addEventListener("input",(e)=>{const q=e.target.value.trim().toLowerCase();if(!q){renderFileList(filesCache);return;}renderFileList(filesCache.filter(f=>f.name.toLowerCase().includes(q)));});
+    document.querySelectorAll(".tab").forEach(tab=>{tab.addEventListener("click",()=>{document.querySelectorAll(".tab").forEach(t=>t.classList.remove("active"));tab.classList.add("active");document.querySelectorAll(".page").forEach(p=>p.classList.remove("active"));document.getElementById("page-"+tab.dataset.page).classList.add("active");});});
+    setInterval(fetchStats,2000);fetchStats();refreshFiles();addTermLine("Linux console ready.");addTermLine("Type `help` for builtins.");
+  </script>
+</body>
+</html>
+"""
+
+
+@APP.get("/")
+def index():
+    return HTML
+
+
+@APP.get("/api/stats")
+def api_stats():
+    return jsonify(system_stats())
+
+
+@APP.post("/api/run")
+def api_run():
+    payload = request.get_json(silent=True) or {}
+    cmd = (payload.get("command") or "").strip()
+    if not cmd:
+        return jsonify({"ok": False, "output": "Empty command"})
+    out, ok = run_linux_like(cmd)
+    return jsonify({"ok": ok, "output": "" if out == "__CLEAR__" else out, "clear": out == "__CLEAR__"})
+
+
+@APP.get("/api/files")
+def api_files():
+    try:
+        return jsonify({"ok": True, "items": list_dir(CURRENT_DIR)})
+    except Exception as ex:
+        return jsonify({"ok": False, "items": [], "message": str(ex)})
+
+
+@APP.get("/api/read")
+def api_read():
+    try:
+        path = safe_path(request.args.get("path"))
+        if path.is_dir():
+            return jsonify({"ok": True, "name": path.name, "kind": "dir", "info": "Folder selected"})
+        kind = file_kind(path)
+        info = f"File | {path.suffix or 'no ext'} | {bytes_to_human(path.stat().st_size)}"
+        if kind == "image":
+            return jsonify({"ok": True, "name": path.name, "kind": "image", "info": info})
+        if kind == "text":
+            return jsonify({"ok": True, "name": path.name, "kind": "text", "info": info, "content": path.read_text(encoding="utf-8", errors="replace")})
+        return jsonify({"ok": True, "name": path.name, "kind": "file", "info": info})
+    except Exception as ex:
+        return jsonify({"ok": False, "message": str(ex)})
+
+
+@APP.get("/api/image")
+def api_image():
+    return send_file(safe_path(request.args.get("path")))
+
+
+@APP.get("/api/download")
+def api_download():
+    try:
+        path = safe_path(request.args.get("path"))
+        if path.is_file():
+            return send_file(path, as_attachment=True, download_name=path.name)
+        temp_dir = Path(tempfile.mkdtemp(prefix="dlzip_"))
+        archive_base = temp_dir / path.name
+        archive_path = shutil.make_archive(str(archive_base), "zip", root_dir=str(path.parent), base_dir=path.name)
+
+        @after_this_request
+        def cleanup(_response):
+            shutil.rmtree(temp_dir, ignore_errors=True)
+            return _response
+
+        return send_file(archive_path, as_attachment=True, download_name=f"{path.name}.zip")
+    except Exception as ex:
+        return jsonify({"ok": False, "message": str(ex)}), 400
+
+
+@APP.post("/api/save")
+def api_save():
+    payload = request.get_json(silent=True) or {}
+    try:
+        path = safe_path(payload.get("path"))
+        if file_kind(path) != "text":
+            return jsonify({"ok": False, "message": "Only text files are editable"})
+        path.write_text(payload.get("content", ""), encoding="utf-8")
+        return jsonify({"ok": True, "message": f"Saved: {path.name}"})
+    except Exception as ex:
+        return jsonify({"ok": False, "message": str(ex)})
+
+
+@APP.post("/api/delete")
+def api_delete():
+    payload = request.get_json(silent=True) or {}
+    try:
+        path = safe_path(payload.get("path"))
+        shutil.rmtree(path) if path.is_dir() else path.unlink(missing_ok=True)
+        return jsonify({"ok": True, "message": f"Deleted: {path.name}"})
+    except Exception as ex:
+        return jsonify({"ok": False, "message": str(ex)})
+
+
+@APP.post("/api/open")
+def api_open():
+    global CURRENT_DIR
+    payload = request.get_json(silent=True) or {}
+    try:
+        path = safe_path(payload.get("path"))
+        if not path.is_dir():
+            return jsonify({"ok": False, "message": "Selected object is not a folder"})
+        CURRENT_DIR = path
+        return jsonify({"ok": True, "message": str(path)})
+    except Exception as ex:
+        return jsonify({"ok": False, "message": str(ex)})
+
+
+@APP.post("/api/up")
+def api_up():
+    global CURRENT_DIR
+    parent = CURRENT_DIR.parent
+    if ROOT_DIR in [parent, *parent.parents]:
+        CURRENT_DIR = parent
+    return jsonify({"ok": True, "current_dir": str(CURRENT_DIR)})
+
+
+@APP.post("/api/create")
+def api_create():
+    payload = request.get_json(silent=True) or {}
+    name = (payload.get("name") or "").strip()
+    if not name:
+        return jsonify({"ok": False, "message": "Filename is empty"})
+    try:
+        path = safe_path(name)
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.touch(exist_ok=True)
+        return jsonify({"ok": True, "message": f"Created: {path.name}"})
+    except Exception as ex:
+        return jsonify({"ok": False, "message": str(ex)})
+
+
+@APP.post("/api/upload")
+def api_upload():
+    files = request.files.getlist("files")
+    count = 0
+    for f in files:
+        if not f.filename:
+            continue
+        target = (CURRENT_DIR / Path(f.filename).name).resolve()
+        if ROOT_DIR not in [target, *target.parents]:
+            continue
+        f.save(str(target))
+        count += 1
+    return jsonify({"ok": True, "message": f"Uploaded: {count}"})
+
+
+if __name__ == "__main__":
+    APP.run(host="0.0.0.0", port=8000, debug=False)
+import os
+import platform
+import shlex
+import shutil
+import socket
+import subprocess
 import time
 from pathlib import Path
 
