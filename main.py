@@ -2,9 +2,6 @@ from telebot import types, TeleBot
 import sqlite3
 import re
 
-import ctypes
-ctypes.windll.kernel32.SetConsoleTitleW("EXAMSFLOW")
-
 import threading
 import time as time_module
 from datetime import datetime, timedelta
